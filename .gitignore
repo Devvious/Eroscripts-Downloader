@@ -1,0 +1,20 @@
+# Created by the program when it runs - contains your login cookie and download history
+eroscripts_downloader_settings.json
+eroscripts_downloader_history.jsonl
+eroscripts_downloader_web/
+funscript_organizer_settings.json
+.esd_write_test
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# Builds
+build/
+dist/
+*.spec
+
+# Unfinished downloads
+*.part
