@@ -21,7 +21,8 @@ Players like ScriptPlayer, MultiFunPlayer and HereSphere pick up the script auto
 - Downloads from Pixeldrain (files, lists and folders), Mega (files and folders), Google Drive (files and folders), Dropbox, MediaFire, Gofile, KrakenFiles, BuzzHeavier, Catbox, e621, PMVHaven, direct file links, and any site yt-dlp supports (PornHub, xHamster, Iwara, SpankBang, ...)
 - A built-in download window for sites that want an "I am human" check or only play the video (VikingFile and similar)
 - Topics with several scripts: each video shows which script it goes with, and you can change it with a right-click
-- Several versions of one script (for example with and without vibration): pick the main one, which gets the folder name together with the video. The others keep their own names, and the folder gets " (+Variation)" at the end
+- Several versions of one script (for example with and without vibration): pick the main one, which gets the folder name together with the video. The others keep their own names, and the folder gets " (+Variation)" at the end. Set your favourite version once in **Extras...** (for example "Handy 2 Pro Overclocked") and it's picked automatically
+- Topic titles that start with a tag like `[Studio]` keep it in the folder name
 - Shows how long each script runs, and warns when a video's length doesn't match
 - "Show post text" shows what each post says about its script or video, handy when a reply links an uncut or re-encoded version
 - Resumes interrupted downloads, queues several topics at once, and can watch the clipboard for topic links

@@ -34,7 +34,7 @@ from datetime import datetime
 from html.parser import HTMLParser
 from pathlib import Path
 
-VERSION = "1.5.0"
+VERSION = "1.5.1"
 DEFAULT_SITE = "https://discuss.eroscripts.com"
 UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
       "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36")
@@ -149,6 +149,7 @@ DEFAULT_SETTINGS = {
     "geometry": "",
     "show_context": False,
     "script_lengths": True,
+    "prefer_versions": "",
 }
 
 
@@ -3090,6 +3091,7 @@ class Core:
         self.http.allow_insecure = bool(st.get("allow_bad_certificates", True))
         self.http.protected_hosts = {self.forum.host[4:] if self.forum.host.startswith("www.")
                                      else self.forum.host}
+        set_preferred(st.get("prefer_versions") or "")
         if st.get("cookie"):
             self.forum.set_cookie_string(st["cookie"])
 
@@ -3334,30 +3336,72 @@ def main_scripts(scripts, all_items=False):
     return out
 
 
+PREFERRED_VERSIONS = []
+
+
+def set_preferred(text):
+    PREFERRED_VERSIONS[:] = [t for t in (name_tokens(x) for x in re.split(r"[,;\n]", text or "")) if t]
+
+
+def preferred_rank(name):
+    toks = name_tokens(name)
+    for n, want in enumerate(PREFERRED_VERSIONS):
+        if want <= toks:
+            return n
+    return len(PREFERRED_VERSIONS)
+
+
 def pick_main(scripts, key=None, all_items=False):
     mains = main_scripts(scripts, all_items)
     if key:
         for i in reversed([x for x in scripts if (all_items or x.checked) and x.ext == SCRIPT_EXT]):
             if i.name[:-len(SCRIPT_EXT)].casefold() == key:
                 return i
-    return mains[0] if mains else None
+    if not mains:
+        return None
+    return min(mains, key=lambda i: (preferred_rank(i.name[:-len(SCRIPT_EXT)]),
+                                     len(name_tokens(i.name[:-len(SCRIPT_EXT)]))))
 
 
 VARIATION_TAG = " (+Variation)"
 
 
-def is_variant(a, b):
-    if not a or not b:
+_BRACKETED = re.compile(r"[(\[{]([^)\]}]*)[)\]}]")
+
+
+VERSION_WORDS = {
+    "smooth", "smoothed", "maxinterval", "max", "interval", "min", "soft", "softer", "hard", "harder", "easy",
+    "easier", "intense", "extreme", "simple", "simplified", "alt", "alternate", "alternative", "vib", "vibe",
+    "vibes", "vibration", "vibrations", "vibrate", "no", "non", "without", "with", "less", "more", "handy",
+    "pro", "overclocked", "oc", "edging", "edge", "beginner", "advanced", "slow", "slower", "fast", "faster",
+    "half", "speed", "cropped", "uncut", "cut", "remastered", "remaster", "redux", "edit", "edited", "fixed",
+    "fix", "updated", "lite", "light", "heavy", "denoised", "funscript", "osr", "sr6", "stroker", "rhythm",
+    "rhythmic", "cock", "hero", "ch", "tease", "gentle", "rough", "teasing", "default", "normal", "standard",
+}
+
+
+def is_variant(a_name, b_name):
+    a, b = name_tokens(a_name), name_tokens(b_name)
+    if not a or not b or a == b:
         return False
-    small, big = (a, b) if len(a) <= len(b) else (b, a)
-    extra = big - small
-    return small <= big and bool(extra) and len(extra) <= 3 and not any(t.isdigit() for t in extra) \
-        and any(len(t) >= 3 for t in small)
+    labels = name_tokens(" ".join(_BRACKETED.findall(a_name) + _BRACKETED.findall(b_name)))
+    core = a & b
+    if not any(len(t) >= 3 for t in core) or len(core) < 0.6 * min(len(a), len(b)):
+        return False
+    extras = [a - core, b - core]
+    loose = [x - labels for x in extras]
+    if any(len(x) > 2 or any(t.isdigit() for t in x) for x in loose):
+        return False
+    if len(core) < 2 and any(loose):
+        return False
+    if all(extras) and all(loose) and not all(x <= VERSION_WORDS for x in loose):
+        return False
+    return True
 
 
 def has_variations(scripts, all_items=False):
-    toks = [name_tokens(i.name[:-len(SCRIPT_EXT)]) for i in main_scripts(scripts, all_items)]
-    return any(is_variant(a, b) for n, a in enumerate(toks) for b in toks[n + 1:])
+    names = [i.name[:-len(SCRIPT_EXT)] for i in main_scripts(scripts, all_items)]
+    return any(is_variant(a, b) for n, a in enumerate(names) for b in names[n + 1:])
 
 
 def folder_name(name, scripts, all_items=False):
@@ -3367,16 +3411,40 @@ def folder_name(name, scripts, all_items=False):
     return base
 
 
+_LEAD_TAG = re.compile(r"^\s*\[([^\]]+)\]\s*")
+_TRAIL_PAREN = re.compile(r"(\s*\([^()]*\))+\s*$")
+
+
+def tagged_name(stem, title):
+    m = _LEAD_TAG.match(title or "")
+    if not m or "[" in stem:
+        return stem
+    tag = m.group(1).strip()
+    tag_toks = name_tokens(tag)
+    clean = _TRAIL_PAREN.sub("", title).strip() or title.strip()
+    core = name_tokens(_LEAD_TAG.sub("", clean)) - tag_toks
+    stoks = name_tokens(stem)
+    label = " ".join(f"({x})" for x in _BRACKETED.findall(stem))
+    loose = stoks - core - tag_toks - name_tokens(label)
+    if core and core <= stoks and all(t.isdigit() for t in loose):
+        return clean + (f" {label}" if label and not name_tokens(label) <= name_tokens(clean) else "")
+    lead = re.match(r"^\s*" + r"[\s_.-]*".join(re.escape(w) for w in re.split(r"[\s_.-]+", tag) if w) +
+                    r"(?![^\W_])[\s_]*(-\s*)?", stem, re.I)
+    if lead and stem[lead.end():].strip():
+        rest = stem[lead.end():]
+        return f"[{tag}] " + ("- " if lead.group(1) else "") + rest
+    return stem
+
+
 def default_name(scripts, title, main_key=None):
-    return tidy_name(_default_name(scripts, title, main_key))
+    return tidy_name(tagged_name(_default_name(scripts, title, main_key), title))
 
 
 def _default_name(scripts, title, main_key=None):
     checked = [i for i in scripts if i.checked]
-    if main_key:
-        m = pick_main(scripts, main_key)
-        if m is not None:
-            return m.name[:-len(SCRIPT_EXT)]
+    m = pick_main(scripts, main_key)
+    if m is not None:
+        return m.name[:-len(SCRIPT_EXT)]
     for i in checked:
         if i.ext == SCRIPT_EXT and not is_axis(i.name[:-len(SCRIPT_EXT)]):
             return i.name[:-len(SCRIPT_EXT)]
@@ -3643,7 +3711,7 @@ def script_variants(sets):
                 continue
             if (a.user or "").casefold() != (b.user or "").casefold():
                 continue
-            if is_variant(a.tokens, b.tokens):
+            if is_variant(a.label, b.label):
                 out.setdefault(i, set()).add(j)
     return out
 
@@ -4778,6 +4846,25 @@ class App:
         ttk.Checkbutton(f, text="Show how long each script runs (reads the scripts when a topic loads - "
                                 "they're kept, so downloading them later costs nothing extra)",
                         variable=len_var, command=len_changed).pack(anchor="w", pady=(0, 8))
+        pv = ttk.Frame(f)
+        pv.pack(fill="x", pady=(0, 8))
+        ttk.Label(pv, text="When a script comes in several versions, make this one the main script "
+                           "(several: separate with commas, first wins):").pack(anchor="w")
+        pref_var = tk.StringVar(value=self.st.get("prefer_versions") or "")
+        pe = ttk.Entry(pv, textvariable=pref_var)
+        pe.pack(fill="x", pady=(2, 0))
+        ttk.Label(pv, text="e.g.  Handy 2 Pro Overclocked, Less Vibrations", foreground="#555555").pack(anchor="w")
+
+        def pref_changed(*_):
+            self.st["prefer_versions"] = pref_var.get().strip()
+            set_preferred(self.st["prefer_versions"])
+            self._save()
+            for t in self.topics:
+                if t.topic is not None and not t.name_edited and not t.main_key:
+                    t.name = default_name(t.scripts, t.topic.title, t.main_key)
+            if self.cur is not None and self.cur.topic is not None:
+                self._render()
+        pref_var.trace_add("write", pref_changed)
         out = tk.Text(f, height=10, width=80, font=("Consolas", 9))
         out.pack(fill="both", expand=True)
         bar = ttk.Frame(f)
