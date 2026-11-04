@@ -34,7 +34,7 @@ from datetime import datetime
 from html.parser import HTMLParser
 from pathlib import Path
 
-VERSION = "1.4.0"
+VERSION = "1.5.0"
 DEFAULT_SITE = "https://discuss.eroscripts.com"
 UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
       "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36")
@@ -99,6 +99,7 @@ STORE_HOSTS = (
     "julesjordan.com", "adulttime.com", "hentaivr.com", "vrlatina.com", "groobyvr.com",
     "slrporn.com", "deovr.com", "heresphere.com", "realjamvr.com", "vrspy.com",
     "dmm.co.jp", "fanza.com", "steampowered.com", "dlsite.com", "itch.io",
+    "payhip.com", "fanbox.cc", "boosty.to",
 )
 IGNORE_HOSTS = (
     "twitter.com", "x.com", "reddit.com", "redd.it", "discord.gg", "discord.com",
@@ -458,11 +459,22 @@ def _host_in(host, hosts):
     return any(host == h or host.endswith("." + h) for h in hosts if h)
 
 
+def ssl_context():
+    ctx = ssl.create_default_context()
+    try:
+        import certifi
+        ctx.load_verify_locations(certifi.where())
+    except Exception:
+        pass
+    return ctx
+
+
 class Http:
     def __init__(self, ua=None):
         self.ua = ua or UA
         self.jar = http.cookiejar.CookieJar()
-        self.opener = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(self.jar))
+        self.opener = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(self.jar),
+                                                  urllib.request.HTTPSHandler(context=ssl_context()))
         self.allow_insecure = True
         self.protected_hosts = set()
         self.insecure_hosts = set()
@@ -1309,7 +1321,59 @@ def _pd_file(info):
     return rf
 
 
+def _pd_fs_list(core, path, depth=0, limit=300):
+    q = urllib.parse.quote(path.lstrip("/"))
+    j = core.http.json(f"https://pixeldrain.com/api/filesystem/{q}?stat")
+    nodes = j.get("path") or []
+    base = j.get("base_index") or 0
+    me = nodes[base] if 0 <= base < len(nodes) else (nodes[-1] if nodes else {})
+    if me.get("type") == "file":
+        return [me], me
+    out = []
+    for c in j.get("children") or []:
+        if len(out) >= limit or (c.get("name") or "").startswith("."):
+            continue
+        if c.get("type") == "file":
+            out.append(c)
+        elif c.get("type") == "dir" and depth < 3:
+            try:
+                out += _pd_fs_list(core, c.get("path") or "", depth + 1, limit - len(out))[0]
+            except Exception:
+                continue
+    return out, me
+
+
+def h_pixeldrain_fs(core, res, path):
+    try:
+        files, top = _pd_fs_list(core, path)
+    except HttpError as e:
+        if e.code in (404, 410):
+            res.status, res.note = DEAD, "deleted on Pixeldrain"
+            return
+        raise
+    root = (top.get("path") or "") if top.get("type") == "dir" else os.path.dirname(top.get("path") or "")
+    res.note = top.get("name") or ""
+    if top.get("name"):
+        res.hints.append(top["name"])
+    if top.get("type") == "file":
+        res.note = ""
+    for f in files:
+        fp = f.get("path") or ""
+        name = f.get("name") or os.path.basename(fp) or "file"
+        rel = fp[len(root):].lstrip("/") if top.get("type") == "dir" and root and fp.startswith(root + "/") \
+            else name
+        url = f"https://pixeldrain.com/api/filesystem/{urllib.parse.quote(fp.lstrip('/'))}?attach"
+        res.files.append(RemoteFile(rel or name, _int(f.get("file_size")), ONLINE, url=res.ref.url,
+                                    dl=dl_http(url, name_hint=name)))
+    if not res.files:
+        res.status, res.note = DEAD, "the Pixeldrain folder is empty"
+
+
 def h_pixeldrain(core, res):
+    fs = re.match(r"/(?:d|api/filesystem)/(.+)", urllib.parse.unquote(urllib.parse.urlsplit(res.ref.url).path))
+    if fs:
+        h_pixeldrain_fs(core, res, "/" + fs.group(1).strip("/"))
+        return
     m = PD_RE.search(urllib.parse.urlsplit(res.ref.url).path)
     if not m:
         res.status, res.note = PAGE, "not a Pixeldrain file link"
@@ -3259,12 +3323,60 @@ def build_script_items(topic):
     return items
 
 
-def default_name(scripts, title):
-    return tidy_name(_default_name(scripts, title))
+def main_scripts(scripts, all_items=False):
+    out, seen = [], set()
+    for i in scripts:
+        if (all_items or i.checked) and i.ext == SCRIPT_EXT and not is_axis(i.name[:-len(SCRIPT_EXT)]):
+            k = i.name[:-len(SCRIPT_EXT)].casefold()
+            if k not in seen:
+                seen.add(k)
+                out.append(i)
+    return out
 
 
-def _default_name(scripts, title):
+def pick_main(scripts, key=None, all_items=False):
+    mains = main_scripts(scripts, all_items)
+    if key:
+        for i in reversed([x for x in scripts if (all_items or x.checked) and x.ext == SCRIPT_EXT]):
+            if i.name[:-len(SCRIPT_EXT)].casefold() == key:
+                return i
+    return mains[0] if mains else None
+
+
+VARIATION_TAG = " (+Variation)"
+
+
+def is_variant(a, b):
+    if not a or not b:
+        return False
+    small, big = (a, b) if len(a) <= len(b) else (b, a)
+    extra = big - small
+    return small <= big and bool(extra) and len(extra) <= 3 and not any(t.isdigit() for t in extra) \
+        and any(len(t) >= 3 for t in small)
+
+
+def has_variations(scripts, all_items=False):
+    toks = [name_tokens(i.name[:-len(SCRIPT_EXT)]) for i in main_scripts(scripts, all_items)]
+    return any(is_variant(a, b) for n, a in enumerate(toks) for b in toks[n + 1:])
+
+
+def folder_name(name, scripts, all_items=False):
+    base = safe_name(name)
+    if has_variations(scripts, all_items) and not base.endswith(VARIATION_TAG.strip()):
+        return safe_name(base + VARIATION_TAG)
+    return base
+
+
+def default_name(scripts, title, main_key=None):
+    return tidy_name(_default_name(scripts, title, main_key))
+
+
+def _default_name(scripts, title, main_key=None):
     checked = [i for i in scripts if i.checked]
+    if main_key:
+        m = pick_main(scripts, main_key)
+        if m is not None:
+            return m.name[:-len(SCRIPT_EXT)]
     for i in checked:
         if i.ext == SCRIPT_EXT and not is_axis(i.name[:-len(SCRIPT_EXT)]):
             return i.name[:-len(SCRIPT_EXT)]
@@ -3523,6 +3635,19 @@ def _structure(ts, sets, atts, post, lis):
     return {}
 
 
+def script_variants(sets):
+    out = {}
+    for i, a in enumerate(sets):
+        for j, b in enumerate(sets):
+            if i == j or not a.tokens or not b.tokens:
+                continue
+            if (a.user or "").casefold() != (b.user or "").casefold():
+                continue
+            if is_variant(a.tokens, b.tokens):
+                out.setdefault(i, set()).add(j)
+    return out
+
+
 def match_videos(ts):
     sets = script_sets(ts.scripts)
     ts.sets = sets
@@ -3585,6 +3710,23 @@ def match_videos(ts):
                         m = ([left[pick[0]]], "the script left over in that post that fits")
         if m:
             out[rid] = m
+    exact, own = {}, set()
+    for rid, li, res, rf, link_level in units:
+        if rf is None:
+            continue
+        toks = frozenset(name_tokens(os.path.splitext(os.path.basename(rf.name))[0]))
+        hit = [i for i, st in enumerate(sets) if toks and frozenset(st.tokens) == toks]
+        if len(hit) == 1:
+            exact[rid] = hit[0]
+            own.add(hit[0])
+    for rid, i in exact.items():
+        if rid not in out or i in out[rid][0]:
+            out[rid] = ([i], "same name as the script")
+    var = script_variants(sets)
+    for rid, (idxs, why) in list(out.items()):
+        more = sorted(set(idxs).union(*[var.get(i, set()) - own for i in idxs]))
+        if len(more) > len(idxs):
+            out[rid] = (more, why + "; versions of the same script")
     for rid, keys in (getattr(ts, "manual", None) or {}).items():
         idxs = [i for i, st in enumerate(sets) if st.key in keys]
         if idxs:
@@ -3642,6 +3784,7 @@ class TopicState:
         self.active_keys = frozenset()
         self.queued_keys = set()
         self.manual = {}
+        self.main_key = None
         self._remote = set()
 
     @property
@@ -3654,8 +3797,9 @@ class TopicState:
         self._remote = set()
         self.sets, self.matches = script_sets(self.scripts), {}
         self.user_pick, self.touched, self.active_keys = None, False, frozenset()
+        self.main_key = None
         if not self.name_edited:
-            self.name = default_name(self.scripts, topic.title)
+            self.name = default_name(self.scripts, topic.title, self.main_key)
 
     def add_remote_scripts(self, res):
         added = False
@@ -3674,7 +3818,7 @@ class TopicState:
             self.scripts.append(it)
             added = True
         if added and not self.name_edited:
-            self.name = default_name(self.scripts, self.topic.title if self.topic else "")
+            self.name = default_name(self.scripts, self.topic.title if self.topic else "", self.main_key)
         return added
 
     def pending(self):
@@ -3839,6 +3983,20 @@ def unpack_video_zip(path, folder, base):
     return out
 
 
+def write_shortcut(folder, title, url):
+    target = Path(folder) / safe_name(f"EroScripts - {title}.url", limit=120)
+    if not target.name.lower().endswith(".url"):
+        target = target.with_name(target.name.rstrip(".") + ".url")
+    data = f"[InternetShortcut]\r\nURL={url}\r\n".encode("utf-8")
+    try:
+        if target.exists() and target.read_bytes() == data:
+            return target
+        target.write_bytes(data)
+    except OSError:
+        return None
+    return target
+
+
 def normalize_main(folder, base):
     folder = Path(folder)
     files = [p for p in folder.iterdir() if p.is_file() and p.name.lower().endswith(SCRIPT_EXT)]
@@ -3887,8 +4045,9 @@ def copy_progress(src, dst, progress, cancel):
 
 
 class Job:
-    def __init__(self, ts, scripts, video, local, local_move, name, dest):
+    def __init__(self, ts, scripts, video, local, local_move, name, dest, main_key=None):
         self.ts = ts
+        self.main_key = main_key
         self.title = ts.topic.title if ts and ts.topic else name
         self.url = ts.topic.url if ts and ts.topic else ""
         self.topic_id = ts.topic.id if ts and ts.topic else None
@@ -3910,7 +4069,8 @@ class Job:
         self.iid = None
 
     def clone(self):
-        j = Job(self.ts, self.scripts, self.video, self.local, self.local_move, self.name, self.dest)
+        j = Job(self.ts, self.scripts, self.video, self.local, self.local_move, self.name, self.dest,
+                self.main_key)
         j.title, j.url, j.topic_id = self.title, self.url, self.topic_id
         return j
 
@@ -3943,13 +4103,12 @@ def _progress_fn(job, report):
 def run_job(core, job, report=lambda: None):
     dest = Path(job.dest)
     base = safe_name(job.name)
-    folder = dest / base
+    folder = dest / folder_name(job.name, job.scripts, all_items=True)
     folder.mkdir(parents=True, exist_ok=True)
     job.folder = folder
     saved = job.saved
 
-    main = next((i for i in job.scripts if i.ext == SCRIPT_EXT and
-                 not is_axis(i.name[:-len(SCRIPT_EXT)])), None)
+    main = pick_main(job.scripts, job.main_key, all_items=True)
     main_stem = main.name[:-len(SCRIPT_EXT)] if main else None
     for n, it in enumerate(job.scripts, 1):
         if job.cancel.is_set():
@@ -3983,6 +4142,10 @@ def run_job(core, job, report=lambda: None):
         else:
             saved.append(write_unique(folder, safe_name(it.name), data))
     normalize_main(folder, base)
+    if job.url:
+        link = write_shortcut(folder, job.title or base, job.url)
+        if link is not None:
+            saved.append(link)
 
     vbase = base
     if job.video is not None or job.local:
@@ -4381,6 +4544,16 @@ class App:
         self.name_var = tk.StringVar()
         self.name_var.trace_add("write", lambda *_: self._on_name_edit())
         ttk.Entry(sv, textvariable=self.name_var).pack(side="left", fill="x", expand=True, padx=6)
+        mv = ttk.Frame(right)
+        self.main_row = mv
+        ttk.Label(mv, text="Main script:").pack(side="left")
+        self.main_var = tk.StringVar()
+        self.main_box = ttk.Combobox(mv, textvariable=self.main_var, state="readonly", width=34)
+        self.main_box.pack(side="left", padx=6)
+        self.main_box.bind("<<ComboboxSelected>>", lambda e: self._pick_main(self.main_box.current()))
+        ttk.Label(mv, text="★ = gets the folder name and the video; the rest keep their names",
+                  foreground="#555555").pack(side="left")
+        self._main_items = []
         lv = ttk.Frame(right)
         self.local_var = tk.StringVar()
         ttk.Label(lv, textvariable=self.local_var, style="Good.TLabel").pack(side="left")
@@ -4394,6 +4567,7 @@ class App:
         ttk.Label(bb, textvariable=self.path_var, foreground="#555555").pack(side="left", padx=8)
         bb.pack(side="bottom", fill="x", pady=(6, 0))
         lv.pack(side="bottom", fill="x")
+        self._main_anchor = lv
         sv.pack(side="bottom", fill="x", pady=(8, 0))
         self.rpane.pack(fill="both", expand=True, pady=(8, 0))
 
@@ -4617,7 +4791,7 @@ class App:
                 self._recheck()
 
         def install():
-            out.insert("end", "Installing yt-dlp, pycryptodome and pywebview...\n")
+            out.insert("end", "Installing yt-dlp, pycryptodome, pywebview and certifi...\n")
             exe = sys.executable
             if exe.lower().endswith("pythonw.exe"):
                 alt = exe[:-len("pythonw.exe")] + "python.exe"
@@ -4627,7 +4801,7 @@ class App:
                 kw = {"creationflags": 0x08000000} if os.name == "nt" else {}
                 try:
                     r = subprocess.run([exe, "-m", "pip", "install", "--upgrade", "yt-dlp", "pycryptodome",
-                                        "pywebview"],
+                                        "pywebview", "certifi"],
                                        capture_output=True, text=True, errors="replace", **kw)
                     self.post(finished, r.returncode, (r.stdout or "")[-3000:] + (r.stderr or "")[-2000:])
                 except Exception as e:
@@ -4827,7 +5001,12 @@ class App:
 
     def _script_values(self, it):
         ts = self.cur
-        return ("✔" if it.checked else "", it.name, it.size_text, it.length_text(), it.where,
+        chk = "✔" if it.checked else ""
+        if it.checked and ts is not None and len(main_scripts(ts.scripts)) > 1 and \
+                pick_main(ts.scripts, ts.main_key) is not None and \
+                it.name.casefold() == pick_main(ts.scripts, ts.main_key).name.casefold():
+            chk = "★"
+        return (chk, it.name, it.size_text, it.length_text(), it.where,
                 post_snippet(ts.topic if ts else None, it.post, it.span))
 
     def _fill_scripts(self):
@@ -4849,6 +5028,35 @@ class App:
         if not ts.scripts:
             self.stree.insert("", "end", iid="none", values=(
                 "", "No script attachments found in the topic.", "", "", "", ""), tags=("off",))
+        self._refresh_main()
+
+    def _refresh_main(self):
+        ts = self.cur
+        mains = main_scripts(ts.scripts) if ts is not None and ts.topic is not None else []
+        self._main_items = mains
+        if len(mains) < 2:
+            self.main_row.pack_forget()
+            return
+        cur = pick_main(ts.scripts, ts.main_key)
+        self.main_box.configure(values=[m.name for m in mains])
+        idx = next((n for n, m in enumerate(mains) if cur is not None and
+                    m.name.casefold() == cur.name.casefold()), 0)
+        self.main_box.current(idx)
+        if not self.main_row.winfo_ismapped():
+            self.main_row.pack(side="bottom", fill="x", pady=(4, 0), before=self._main_anchor)
+
+    def _pick_main(self, idx):
+        ts = self.cur
+        if ts is None or not 0 <= idx < len(self._main_items):
+            return
+        it = self._main_items[idx]
+        ts.main_key = it.name[:-len(SCRIPT_EXT)].casefold()
+        ts.name_edited = False
+        ts.name = default_name(ts.scripts, ts.topic.title, ts.main_key)
+        self._set_name(ts.name)
+        for iid, x in self.srows.items():
+            self.stree.set(iid, "chk", self._script_values(x)[0])
+        self._refresh_main()
 
     def _script_iid(self, it):
         return next((iid for iid, x in self.srows.items() if x is it), None)
@@ -4913,8 +5121,14 @@ class App:
         if ts is None:
             return
         ts.touched = True
+        if ts.main_key and pick_main(ts.scripts, ts.main_key) is not None and \
+                pick_main(ts.scripts, ts.main_key).name[:-len(SCRIPT_EXT)].casefold() != ts.main_key:
+            ts.main_key = None
+        for iid, x in self.srows.items():
+            self.stree.set(iid, "chk", self._script_values(x)[0])
+        self._refresh_main()
         if not ts.name_edited:
-            ts.name = default_name(ts.scripts, ts.topic.title)
+            ts.name = default_name(ts.scripts, ts.topic.title, ts.main_key)
             self._set_name(ts.name)
         ticked = ticked_sets(ts) if len(ts.sets) > 1 else []
         if len(ticked) == 1:
@@ -4955,13 +5169,14 @@ class App:
             self.path_var.set("")
             return
         base = safe_name(name) if name else ""
-        self.path_var.set(f"→  {os.path.join(dest, base)}{os.sep}" if dest and base else "")
+        fname = folder_name(name, ts.scripts) if name else ""
+        self.path_var.set(f"→  {os.path.join(dest, fname)}{os.sep}" if dest and base else "")
         msgs = []
         h = self.history.get(ts.topic.id)
         if h:
             msgs.append(f"You downloaded this topic on {h.get('time', '?')[:10]} into {h.get('folder')}.")
         if dest and base:
-            folder = Path(dest) / base
+            folder = Path(dest) / fname
             v = existing_video(folder, base)
             if v is not None:
                 msgs.append(f"Already in your library: {folder} (has {v.name}).")
@@ -5077,6 +5292,12 @@ class App:
                          command=lambda: self._toggle_script(iid))
         if len(ts.scripts) > 1:
             menu.add_command(label="Use only this script", command=lambda: self._only_script(iid))
+        mains = main_scripts(ts.scripts)
+        if it.checked and len(mains) > 1 and it.ext == SCRIPT_EXT and not is_axis(it.name[:-len(SCRIPT_EXT)]):
+            idx = next((n for n, m in enumerate(mains) if m.name.casefold() == it.name.casefold()), None)
+            if idx is not None:
+                menu.add_command(label="Make this the main script (gets the folder name)",
+                                 command=lambda: self._pick_main(idx))
         if it.ext in (SCRIPT_EXT, ".zip") and it.length_state not in ("ok", "reading"):
             why = it.length_state if it.length_state not in ("", "skipped") else ""
             menu.add_command(label="Read its length" + (f"  (last time: {why[:60]})" if why else ""),
@@ -5333,8 +5554,9 @@ class App:
         if keys == ts.active_keys and set(ticked_sets(ts)) == set(m[0]):
             return False
         apply_match(ts, m[0])
+        ts.main_key = None
         ts.name_edited = False
-        ts.name = default_name(ts.scripts, ts.topic.title)
+        ts.name = default_name(ts.scripts, ts.topic.title, ts.main_key)
         self._fill_scripts()
         self._set_name(ts.name)
         return True
@@ -5624,7 +5846,7 @@ class App:
                              parent=self.root)
             return
         base = safe_name(name)
-        folder = Path(dest) / base
+        folder = Path(dest) / folder_name(name, scripts, all_items=True)
         have = existing_video(folder, base)
         if (video is not None or local) and have is not None:
             if not self.mb.askyesno("Already in your library",
@@ -5646,7 +5868,7 @@ class App:
                 pass
         self.st["dest"] = dest
         self._save()
-        job = Job(ts, scripts, video, local, ts.local_move, name, dest)
+        job = Job(ts, scripts, video, local, ts.local_move, name, dest, ts.main_key)
         self._queue_job(job)
         ts.jobs.append(job)
         self._topic_state(ts, "queued")
@@ -5667,8 +5889,9 @@ class App:
         nxt = left[0]
         apply_match(ts, [nxt])
         ts.local_video = None
+        ts.main_key = None
         ts.name_edited = False
-        ts.name = default_name(ts.scripts, ts.topic.title)
+        ts.name = default_name(ts.scripts, ts.topic.title, ts.main_key)
         rows, _ = video_rows(ts, bool(self.dead_var.get()))
         ts.user_pick = best_row(rows, ts.matches, {ts.sets[nxt].key}, ts.sets)
         self._render()
@@ -5768,7 +5991,7 @@ class App:
     def _open_job_folder(self):
         j = self._selected_job()
         if j is not None:
-            p = j.folder or Path(j.dest) / safe_name(j.name)
+            p = j.folder or Path(j.dest) / folder_name(j.name, j.scripts, all_items=True)
             open_path(p if Path(p).exists() else j.dest)
 
     def _cancel_job(self):
@@ -6055,7 +6278,15 @@ def cli_topic(core, url, dest, args):
             want = {int(x) for x in re.findall(r"\d+", a)}
             for n, it in enumerate(ts.scripts, 1):
                 it.checked = n in want
-    name = default_name(ts.scripts, topic.title)
+    mains = main_scripts(ts.scripts)
+    if len(mains) > 1 and not args.auto:
+        print(bold("\nMain script (gets the folder name, with the video - the others keep their names):"))
+        for n, it in enumerate(mains, 1):
+            print(f"  {n:>2}) {it.name}")
+        a = ask("Which one? [Enter = 1]: ").strip()
+        if a.isdigit() and 1 <= int(a) <= len(mains):
+            ts.main_key = mains[int(a) - 1].name[:-len(SCRIPT_EXT)].casefold()
+    name = default_name(ts.scripts, topic.title, ts.main_key)
 
     scripts = [i for i in ts.scripts if i.checked]
     if not scripts and video is None and not local:
@@ -6064,7 +6295,7 @@ def cli_topic(core, url, dest, args):
     if not args.auto:
         n = ask(f"Folder name [{safe_name(name)}]: ").strip()
         name = n or name
-    folder = Path(dest) / safe_name(name)
+    folder = Path(dest) / folder_name(name, scripts, all_items=True)
     print(f"Saving to {folder}")
     if args.dry_run:
         print(yellow("Dry run - nothing downloaded."))
@@ -6072,7 +6303,7 @@ def cli_topic(core, url, dest, args):
     move = True
     if local and not args.auto:
         move = not ask("Move it (M) or copy it (c)? ").strip().lower().startswith("c")
-    job = Job(ts, scripts, video, local, move, name, dest)
+    job = Job(ts, scripts, video, local, move, name, dest, ts.main_key)
     try:
         run_job(core, job, _console_report(job))
     except Cancelled:
