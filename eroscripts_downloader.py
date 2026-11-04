@@ -34,7 +34,7 @@ from datetime import datetime
 from html.parser import HTMLParser
 from pathlib import Path
 
-VERSION = "1.5.1"
+VERSION = "1.5.2"
 DEFAULT_SITE = "https://discuss.eroscripts.com"
 UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
       "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36")
@@ -111,7 +111,7 @@ IGNORE_HOSTS = (
     "subscribestar.adult", "gumroad.com", "imgur.com", "ibb.co", "imgbb.com", "gyazo.com",
     "postimg.cc", "postimages.org", "tenor.com", "giphy.com", "handyfeeling.com",
     "thehandy.com", "openfunscripter.org", "buttplug.io", "intiface.com", "xtoys.app",
-    "eroscripts.com", "faptap.net",
+    "eroscripts.com", "faptap.net", "airscripts.fun", "t.co",
     "imgsli.com", "slow.pics", "imgbox.com", "imgchest.com", "pixhost.to", "imagebam.com", "prnt.sc",
     "prntscr.com", "imagetwist.com", "freeimage.host", "vgy.me", "imgpile.com", "lervik.com",
 )
@@ -1258,6 +1258,7 @@ class RemoteFile:
         self.duration = duration
         self.url = url
         self.media = ""
+        self.probe = None
         self.deco = False
 
     @property
@@ -1267,6 +1268,50 @@ class RemoteFile:
     @property
     def is_script(self):
         return self.name.lower().endswith(SCRIPT_EXT)
+
+
+def _mvhd_seconds(buf):
+    i = buf.find(b"mvhd")
+    while i >= 4:
+        b = buf[i + 4:i + 40]
+        try:
+            if b[0] == 1:
+                ts, dur = struct.unpack(">IQ", b[20:32])
+            else:
+                ts, dur = struct.unpack(">II", b[12:20])
+        except (struct.error, IndexError):
+            return None
+        if ts and 0 < dur / ts < 24 * 3600:
+            return dur / ts
+        i = buf.find(b"mvhd", i + 4)
+    return None
+
+
+def media_duration(http_, url, headers=None):
+    ext = ext_of(urllib.parse.urlsplit(url).path)
+    if ext and ext not in (".mp4", ".m4v", ".mov", ""):
+        return None
+    h = dict(headers or {})
+    try:
+        r = http_.open(url, headers=dict(h, Range="bytes=0-1048575"), timeout=20)
+        with r:
+            if "text/html" in (r.headers.get("Content-Type") or "").lower():
+                return None
+            head = r.read(1_048_576)
+            total = None
+            m = re.search(r"/(\d+)\s*$", r.headers.get("Content-Range") or "")
+            if m:
+                total = int(m.group(1))
+        if head[4:8] not in (b"ftyp", b"moov", b"free", b"wide", b"mdat"):
+            return None
+        d = _mvhd_seconds(head)
+        if d is not None or not total or total <= len(head):
+            return d
+        r = http_.open(url, headers=dict(h, Range=f"bytes={max(0, total - 4_194_304)}-"), timeout=25)
+        with r:
+            return _mvhd_seconds(r.read(4_194_304))
+    except Exception:
+        return None
 
 
 class LinkResult:
@@ -1313,6 +1358,7 @@ def _pd_file(info):
     name = info.get("name") or fid
     rf = RemoteFile(name, info.get("size"), ONLINE, url=f"https://pixeldrain.com/u/{fid}",
                     dl=dl_http(f"https://pixeldrain.com/api/file/{fid}?download", name_hint=name))
+    rf.probe = (f"https://pixeldrain.com/api/file/{fid}", None)
     av = (info.get("availability") or "").lower()
     if "captcha" in av or info.get("can_download") is False:
         rf.status, rf.dl = BROWSER, None
@@ -1364,8 +1410,10 @@ def h_pixeldrain_fs(core, res, path):
         rel = fp[len(root):].lstrip("/") if top.get("type") == "dir" and root and fp.startswith(root + "/") \
             else name
         url = f"https://pixeldrain.com/api/filesystem/{urllib.parse.quote(fp.lstrip('/'))}?attach"
-        res.files.append(RemoteFile(rel or name, _int(f.get("file_size")), ONLINE, url=res.ref.url,
-                                    dl=dl_http(url, name_hint=name)))
+        rf = RemoteFile(rel or name, _int(f.get("file_size")), ONLINE, url=res.ref.url,
+                        dl=dl_http(url, name_hint=name))
+        rf.probe = (url, None)
+        res.files.append(rf)
     if not res.files:
         res.status, res.note = DEAD, "the Pixeldrain folder is empty"
 
@@ -2009,6 +2057,7 @@ def h_direct(core, res, note=""):
         or "video"
     res.files = [RemoteFile(name, info["size"], ONLINE, url=url, note=note,
                             dl=dl_http(url, name_hint=name))]
+    res.files[0].probe = (url, None)
 
 
 def h_eroscripts(core, res):
@@ -2301,6 +2350,15 @@ def decorative_media(body, base):
 def videos_on_page(core, page_url, body, title, referer=None, note="found on the page"):
     referer = referer or page_url
     cands = find_media_urls(body, page_url)
+    more = []
+    for u in cands:
+        m = re.search(r"\.mov(\d{3,4})\.mp4", u)
+        if m:
+            for alt in (".mov.mp4", ".mov1080.mp4", ".mov720.mp4"):
+                v = u[:m.start()] + alt + u[m.end():]
+                if v not in cands and v not in more:
+                    more.append(v)
+    cands = more + cands
     deco = decorative_media(body, page_url)
     direct, streams = [], []
     for u in cands:
@@ -2333,6 +2391,7 @@ def videos_on_page(core, page_url, body, title, referer=None, note="found on the
         rf = RemoteFile(name, info["size"], ONLINE, url=page_url, note=note + warn,
                         dl=dl_http(u, headers={"Referer": referer}, name_hint=name))
         rf.media, rf.deco = u, u in deco
+        rf.probe = (u, {"Referer": referer})
         files.append(rf)
     if not files and streams:
         s = streams[0]
@@ -3132,6 +3191,9 @@ class Core:
             res.status, res.note = UNKNOWN, f"check failed: {str(e)[:160]}"
         if res.status == CHECKING:
             res.status = min((f.status for f in res.files), key=STATUS_RANK.get) if res.files else UNKNOWN
+        for f in [f for f in res.files if not f.is_script and f.duration is None and f.probe
+                  and f.status == ONLINE][:12]:
+            f.duration = media_duration(self.http, *f.probe)
         if self.http.bad_cert(ref.url):
             warn = "⚠ the site's security certificate is expired/invalid - checked anyway"
             res.note = f"{warn}. {res.note}" if res.note else warn
@@ -3404,6 +3466,51 @@ def has_variations(scripts, all_items=False):
     return any(is_variant(a, b) for n, a in enumerate(names) for b in names[n + 1:])
 
 
+PATH_LIMIT = 250
+
+
+def shorten(text, n):
+    text = text.strip()
+    if len(text) <= n:
+        return text
+    head, sep, tail = text.rpartition(" - ")
+    if sep and head and len(tail) <= min(40, n // 3) and not tail.endswith(VARIATION_TAG.strip()):
+        return _shorten(head, n - len(tail) - 4) + "… - " + tail
+    return _shorten(text, n)
+
+
+def _shorten(text, n):
+    text = text.strip()
+    if len(text) <= n:
+        return text
+    cut = text[:n]
+    sp = max(cut.rfind(" "), cut.rfind("_"))
+    if sp >= n * 0.6:
+        cut = cut[:sp]
+    return cut.rstrip(" -._,") or text[:n]
+
+
+def fit_name(folder, name, room=6):
+    ext = ext_of(name)
+    stem = name[:-len(ext)] if ext else name
+    allowed = PATH_LIMIT - len(str(folder)) - 1 - len(ext) - room
+    if len(stem) <= allowed:
+        return name
+    return shorten(stem, max(20, allowed)) + ext
+
+
+def job_names(dest, name, scripts, all_items=False):
+    base = safe_name(name)
+    fname = folder_name(name, scripts, all_items)
+    budget = PATH_LIMIT - len(str(dest)) - 1
+    if len(fname) + 1 + len(base) + 26 > budget:
+        tag = VARIATION_TAG if fname.endswith(VARIATION_TAG.strip()) else ""
+        keep = max(30, (budget - 28) // 2 - len(tag))
+        base = shorten(base, keep)
+        fname = base + tag
+    return fname, base
+
+
 def folder_name(name, scripts, all_items=False):
     base = safe_name(name)
     if has_variations(scripts, all_items) and not base.endswith(VARIATION_TAG.strip()):
@@ -3436,8 +3543,56 @@ def tagged_name(stem, title):
     return stem
 
 
+def _edit1(a, b):
+    if a == b or abs(len(a) - len(b)) > 1:
+        return False
+    if a + "s" == b or b + "s" == a or a + "es" == b or b + "es" == a:
+        return False
+    if len(a) == len(b):
+        diff = [i for i in range(len(a)) if a[i] != b[i]]
+        return len(diff) == 1 or (len(diff) == 2 and diff[1] == diff[0] + 1 and
+                                  a[diff[0]] == b[diff[1]] and a[diff[1]] == b[diff[0]])
+    if len(a) > len(b):
+        a, b = b, a
+    for i in range(len(b)):
+        if a == b[:i] + b[i + 1:]:
+            return True
+    return False
+
+
+def fix_typos(stem, title):
+    words = {w.casefold(): w for w in re.findall(r"[^\W\d_]{3,}", title or "")}
+    if not words:
+        return stem
+
+    def swap(m):
+        w = m.group(0)
+        if w.casefold() in words:
+            return w
+        hits = [t for k, t in words.items() if _edit1(w.casefold(), k) and k not in stem.casefold()]
+        return hits[0] if len(hits) == 1 else w
+    return re.sub(r"[^\W\d_]{3,}", swap, stem)
+
+
 def default_name(scripts, title, main_key=None):
-    return tidy_name(tagged_name(_default_name(scripts, title, main_key), title))
+    stem = fix_typos(_default_name(scripts, title, main_key), title)
+    if title and not re.search(r"[^\W\d_]{3}", tidy_name(stem)):
+        stem = _TRAIL_PAREN.sub("", title).strip() or title
+    return tidy_name(tagged_name(stem, title))
+
+
+def script_length(ts, keys=None):
+    if ts is None:
+        return None
+    pool = ts.scripts
+    if keys:
+        pool = [i for st in ts.sets if st.key in keys for i in st.items]
+    elif any(i.checked for i in ts.scripts):
+        pool = [i for i in ts.scripts if i.checked]
+    m = pick_main(pool, ts.main_key, all_items=True)
+    if m is not None and m.length_state == "ok" and not isinstance(m.length, tuple):
+        return m.length
+    return None
 
 
 def _default_name(scripts, title, main_key=None):
@@ -3970,7 +4125,13 @@ def video_rows(ts, show_dead=False):
     return rows, hidden
 
 
-def best_row(rows, matches=None, keys=None, sets=None):
+def best_row(rows, matches=None, keys=None, sets=None, want=None):
+    if want:
+        fits = [r for r in rows if r[2] is not None and r[2].duration and abs(r[2].duration - want) <= 5]
+        if fits:
+            got = best_row(fits, matches, keys, sets)
+            if got:
+                return got
     for rid, res, rf, _ in rows:
         if rf is None or not rf.downloadable or res.kind == "eroscripts":
             continue
@@ -3998,7 +4159,7 @@ def check_funscript(data, name):
 
 
 def write_unique(folder, name, data):
-    target = Path(folder) / name
+    target = Path(folder) / fit_name(folder, name)
     if target.exists():
         try:
             if target.read_bytes() == data:
@@ -4034,7 +4195,7 @@ def unpack_video_zip(path, folder, base):
         vids = sorted((m for m in _zip_members(zf) if ext_of(m.filename) in VIDEO_EXTS),
                       key=lambda m: -m.file_size)
         for n, m in enumerate(vids):
-            name = base + ext_of(m.filename) if n == 0 else safe_name(os.path.basename(m.filename))
+            name = base + ext_of(m.filename) if n == 0 else fit_name(folder, safe_name(os.path.basename(m.filename)))
             target = unique_path(Path(folder) / name)
             tmp = target.with_name(target.name + ".tmp")
             with zf.open(m) as fi, open(tmp, "wb") as fo:
@@ -4052,7 +4213,7 @@ def unpack_video_zip(path, folder, base):
 
 
 def write_shortcut(folder, title, url):
-    target = Path(folder) / safe_name(f"EroScripts - {title}.url", limit=120)
+    target = Path(folder) / fit_name(folder, safe_name(f"EroScripts - {title}.url", limit=120), room=2)
     if not target.name.lower().endswith(".url"):
         target = target.with_name(target.name.rstrip(".") + ".url")
     data = f"[InternetShortcut]\r\nURL={url}\r\n".encode("utf-8")
@@ -4170,8 +4331,8 @@ def _progress_fn(job, report):
 
 def run_job(core, job, report=lambda: None):
     dest = Path(job.dest)
-    base = safe_name(job.name)
-    folder = dest / folder_name(job.name, job.scripts, all_items=True)
+    fname, base = job_names(dest, job.name, job.scripts, all_items=True)
+    folder = dest / fname
     folder.mkdir(parents=True, exist_ok=True)
     job.folder = folder
     saved = job.saved
@@ -5225,7 +5386,7 @@ class App:
             m = ts.matches.get(sel[0]) if sel else None
             if not m or key not in {ts.sets[i].key for i in m[0] if i < len(ts.sets)}:
                 rows, _ = video_rows(ts, bool(self.dead_var.get()))
-                rid = best_row(rows, ts.matches, {key}, ts.sets)
+                rid = best_row(rows, ts.matches, {key}, ts.sets, want=script_length(ts, {key}))
                 if rid:
                     ts.user_pick = rid
                     self.vtree.selection_set(rid)
@@ -5693,8 +5854,9 @@ class App:
             self.vtree.insert("", "end", iid="none", values=("", "", msg, "", "", "", "", "", ""))
         target = keep if keep in self.vrows else None
         if target is None and ts.active_keys and len(ts.sets) > 1:
-            target = best_row(rows, ts.matches, ts.active_keys, ts.sets)
-        target = target or best_row(rows)
+            target = best_row(rows, ts.matches, ts.active_keys, ts.sets,
+                              want=script_length(ts, ts.active_keys))
+        target = target or best_row(rows, want=script_length(ts) if len(ts.sets) <= 1 else None)
         if target:
             self.vtree.selection_set(target)
             self.vtree.see(target)
@@ -5941,6 +6103,13 @@ class App:
                                     f"one anyway? It's saved next to it as \"{base} (2)\".",
                                     parent=self.root):
                 return
+        sl = script_length(ts)
+        if video is not None and video.duration and sl and video.duration < sl - 10:
+            if not self.mb.askyesno(
+                    "Video shorter than the script",
+                    f"The video is {fmt_dur(video.duration)} long, but the script runs {fmt_dur(sl)}.\n\n"
+                    "It's probably a preview or a cut version. Download it anyway?", parent=self.root):
+                return
         if video is not None and video.size:
             probe_dir = Path(dest)
             while not probe_dir.exists() and probe_dir.parent != probe_dir:
@@ -5980,7 +6149,8 @@ class App:
         ts.name_edited = False
         ts.name = default_name(ts.scripts, ts.topic.title, ts.main_key)
         rows, _ = video_rows(ts, bool(self.dead_var.get()))
-        ts.user_pick = best_row(rows, ts.matches, {ts.sets[nxt].key}, ts.sets)
+        ts.user_pick = best_row(rows, ts.matches, {ts.sets[nxt].key}, ts.sets,
+                                want=script_length(ts, {ts.sets[nxt].key}))
         self._render()
         if ts.user_pick is None:
             self.vtree.selection_set(())
